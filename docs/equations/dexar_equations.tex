@@ -1,0 +1,172 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=2.4cm]{geometry}
+\usepackage{amsmath,amssymb,booktabs,microtype}
+\usepackage[colorlinks=true,linkcolor=black,urlcolor=blue]{hyperref}
+
+\newcommand{\Vset}{\mathcal{V}}
+\newcommand{\Tset}{\mathcal{T}}
+\newcommand{\relu}[1]{\left(#1\right)^{+}}
+
+\title{\textbf{DEX-AR: the equations, before and after the rank prefilter}}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2.2\baselineskip}
+
+\noindent\rule{\textwidth}{0.4pt}
+\vspace{0.4em}
+
+\noindent This note states what DEX-AR computes as published, then states the one
+line that changes. Everything here is transcribed from the implementation in
+\texttt{dexar/wrapper.py}; equation numbers in parentheses refer to the paper
+(Bousselham et al., \emph{DEX-AR: A Dynamic Explainability Method for
+Autoregressive VLMs}, arXiv:2603.06302).
+
+\section{Notation}
+
+For a generation step $t$, layer $l \in \{1,\dots,L\}$ and attention head
+$i \in \{1,\dots,H\}$:
+
+\begin{tabular}{@{}ll@{}}
+\toprule
+$\Vset$, $\Tset$ & the image-token and text-token positions of the sequence; $N = |\Vset| = h \times w$ \\
+$A^{l,t}$        & attention probabilities at layer $l$, step $t$ \\
+$y^{l}_{t}$      & hidden state at the last position, layer $l$ \\
+$o^{l,t}$        & intermediate logits, $o^{l,t} = \mathrm{LM\_Head}(y^{l}_{t})$ \quad (Eq.~3, the logit lens) \\
+$v_t$            & the sampled token at step $t$: the final layer's argmax \quad (Eq.~2) \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent DEX-AR differentiates the sampled token's intermediate logit with
+respect to the attention probabilities, and keeps only the last query row --- the
+row belonging to the position that is about to emit $v_t$:
+
+\begin{equation}
+G^{l,t,i}[j] \;=\; \relu{\frac{\partial\, o^{l,t}_{v_t}}{\partial\, A^{l,t}_{i}[-1, j]}},
+\qquad j \in \Vset ,
+\label{eq:grad}
+\end{equation}
+
+\noindent and the same quantity over $j \in \Tset$, written $G^{l,t,i}_{\text{txt}}$.
+Each $G^{l,t,i}$ is a map over the $N$ image positions, reshaped to the token
+grid $h \times w$. Because
+$\partial o / \partial A_{[\cdot,j]} = \langle v_j, g\rangle$, this map carries a
+factor of the value-vector norm $\lVert v_j \rVert$ but no factor of $A_j$
+itself: DEX-AR reads counterfactual sensitivity, not realised usage.
+
+\section{DEX-AR as published}
+
+\paragraph{Head scores (Eq.~4).} Two scalars per head, each a maximum over the
+columns of the respective block. These produce no heatmap; they are a scoring
+step.
+\begin{align}
+S^{l,t,i}_{\text{img}}  &= \max_{j \in \Vset} \; G^{l,t,i}[j], \label{eq:simg}\\
+S^{l,t,i}_{\text{txt}} &= \max_{j \in \Tset} \; G^{l,t,i}_{\text{txt}}[j]. \label{eq:stext}
+\end{align}
+
+\paragraph{Head filter and per-token map (Eq.~5).} Each head is weighted by how
+much more it attends to image than to text, and the weighted maps are summed
+over \emph{all} $L$ layers and all $H$ heads:
+\begin{align}
+w^{l,t,i} &= \relu{S^{l,t,i}_{\text{img}} - S^{l,t,i}_{\text{txt}}}, \label{eq:w}\\
+E^{(t)}   &= \sum_{l=1}^{L}\sum_{i=1}^{H} w^{l,t,i} \cdot G^{l,t,i}. \label{eq:etoken}
+\end{align}
+
+\paragraph{Token filter and sentence map (Eq.~6).} The per-token maps are
+aggregated under a token weight that applies the same difference to the
+\emph{global} maxima, taken across every layer and head:
+\begin{align}
+\delta^{t} &= \relu{\max_{l,i} S^{l,t,i}_{\text{img}} \;-\; \max_{l,i} S^{l,t,i}_{\text{txt}}}, \label{eq:delta}\\
+\bar{E}    &= \sum_{t=1}^{T} \delta^{t} \cdot E^{(t)}. \label{eq:esent}
+\end{align}
+
+\paragraph{Where the weight comes from.} Both filters are decided by
+$\max_p G(p)$ --- a head's single tallest cell, and nothing else about the shape
+of its map. Two heads with the same peak score identically whether that peak sits
+in a coherent region or alone.
+
+\section{After: the rank prefilter}
+
+\paragraph{The operator.} Let $R_k$ take, at every cell, the $k$-th order
+statistic of that cell's $3\times3$ neighbourhood on the token grid, with
+replicate padding at the border:
+\begin{equation}
+\bigl(R_k\,G\bigr)(p) \;=\; \operatorname{sort}\Bigl(\bigl\{\,G(q) \;:\; q \in \mathcal{N}_{3\times3}(p)\,\bigr\}\Bigr)_{k},
+\qquad k \in \{0,\dots,8\}.
+\label{eq:rank}
+\end{equation}
+$k = 0$ is erosion, $k = 4$ the median, $k = 8$ dilation. Border cells replicate
+rather than zero-pad: zero padding would erode the border as a padding artifact,
+which on a model with a border-peak bias would look like the method working.
+
+\paragraph{Why it targets \eqref{eq:simg}.} An isolated spike cannot survive a
+sub-median $R_k$ --- its neighbourhood holds eight small values --- while a
+coherent region can. Applying $R_k$ \emph{before} \eqref{eq:simg} rewrites the
+head score from ``the tallest cell'' into ``the tallest cell that has
+neighbours'', without touching the form of Eq.~5 or Eq.~6.
+
+\paragraph{The rescale.} $S_{\text{txt}}$ lives on the one-dimensional token
+sequence and receives no matching operation. Left alone, the subtraction in
+\eqref{eq:w} would compare a filtered quantity against an unfiltered one and the
+head weights would collapse. So $S_{\text{img}}$ is rescaled per $(t,l)$ by the
+ratio of medians over heads:
+\begin{equation}
+c^{l,t} \;=\; \frac{\operatorname{median}_{i}\,\max_p G^{l,t,i}(p)}
+                   {\operatorname{median}_{i}\,\max_p \bigl(R_k G^{l,t,i}\bigr)(p)} .
+\label{eq:rescale}
+\end{equation}
+
+\paragraph{The two lines that change.} Equations \eqref{eq:grad},
+\eqref{eq:stext}, \eqref{eq:w}, \eqref{eq:etoken}, \eqref{eq:delta} and
+\eqref{eq:esent} are untouched. Only these are new:
+\begin{align}
+\widetilde{G}^{l,t,i}         &= R_k\, G^{l,t,i}, \tag{\ref{eq:grad}$'$}\\
+\widetilde{S}^{l,t,i}_{\text{img}} &= c^{l,t} \cdot \max_{j \in \Vset} \; \widetilde{G}^{l,t,i}[j], \tag{\ref{eq:simg}$'$}
+\end{align}
+with $\widetilde{G}$ and $\widetilde{S}_{\text{img}}$ substituted for $G$ and
+$S_{\text{img}}$ everywhere downstream. Setting $k$ to nothing recovers the
+published method exactly: the prefilter is off by default.
+
+\section{Metrics}
+
+All reported $\times 100$. $A$ is the map bilinearly upsampled to mask
+resolution and min-max normalised; $M$ is the ground-truth mask (the union of
+every object present).
+
+\begin{align*}
+\text{soft-IoU} &= \frac{\sum AM}{\sum A + \sum M - \sum AM} &&\text{threshold-free}\\
+\text{IoU}      &= \max_{\tau \in \{\tau_1 \dots \tau_{20}\}} \operatorname{IoU}\bigl(A > \tau,\; M\bigr) &&\text{best of $k=20$ thresholds, per prediction}\\
+\text{EPG}      &= \frac{\sum AM}{\sum A} &&\text{share of attribution energy inside the mask}\\
+\text{SNR}      &= 10 \log_{10}\!\left( \frac{\langle A, M\rangle / \lVert M \rVert_1}{\langle A, 1-M\rangle / \lVert 1-M \rVert_1} \right) &&\text{$0$ for a uniform map}
+\end{align*}
+
+\noindent Soft-IoU and EPG both rise with object area, so neither separates
+signal from noise on its own: on the 1449-image PascalVOC val split a random
+smooth map scores soft-IoU $18.41$ / IoU $25.46$ / EPG $25.24$ / SNR $-0.01$, and
+a uniform map scores $25.24$ on all three of the paper's metrics. SNR is the only
+one of the four with a defined zero. Recompute the chance lines for any other
+split with \texttt{experiments/voc\_nulls.py}.
+
+\section{Where this lives in the code}
+
+\begin{tabular}{@{}ll@{}}
+\toprule
+\eqref{eq:grad}, \eqref{eq:simg}, \eqref{eq:stext} & \texttt{dexar/wrapper.py}, the per-layer loop in \texttt{compute\_dexar} \\
+\eqref{eq:rank}                                    & \texttt{dexar/wrapper.py}, \texttt{DexarWrapper.\_rank\_filter} \\
+\eqref{eq:rescale}                                 & \texttt{dexar/wrapper.py}, the \texttt{map\_filter} branch \\
+\eqref{eq:w}, \eqref{eq:etoken}                    & \texttt{dexar/wrapper.py}, ``Head filtering (Eq.~5)'' \\
+\eqref{eq:delta}, \eqref{eq:esent}                 & \texttt{dexar/wrapper.py}, sentence aggregation \\
+metrics                                            & \texttt{experiments/eval\_masks.py}, \texttt{score()} \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent The prefilter is reached as
+\texttt{compute\_dexar(..., map\_filter="rank:k")}, or \texttt{MAP\_FILTER=rank:k}
+for \texttt{eval\_masks.py}. \texttt{rank:k:noscale} ablates \eqref{eq:rescale}.
+\texttt{drop\_delta} sets $\delta^{t} = 1$, which switches off \eqref{eq:delta}.
+
+\end{document}
