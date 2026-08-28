@@ -1,1 +1,21 @@
 /.DS_Store
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Machine-specific paths (copy paths.ini to it and edit)
+paths.local.ini
+
+# Slurm job output
+logs/*.out
+
+# Evaluation output: metrics.txt and per_image.json are small and worth keeping;
+# nothing else under results/ is anything a rerun cannot regenerate.
+results/**/*.pt
+results/**/*.png
+results/**/*.pdf
+
+# LaTeX build products (the .tex and the .pdf are tracked)
+docs/equations/*.aux
+docs/equations/*.log
+docs/equations/*.out
